@@ -21,6 +21,7 @@ const { execSync, exec } = require('child_process');
 const { promisify } = require('util');
 const FormData = require('form-data');
 const fetch = require('node-fetch');
+const ffmpegPath = require('ffmpeg-static');
 
 const execAsync = promisify(exec);
 const app = express();
@@ -129,7 +130,7 @@ app.post('/api/transcribe', upload.single('audioFile'), async (req, res) => {
   const chunkPattern = `${chunkPrefix}%03d.mp3`;
 
   const ffmpegCmd = [
-    'ffmpeg',
+    `"${ffmpegPath}"`,
     '-y',                         // 上書き確認なし
     `-i "${uploadedPath}"`,       // 入力ファイル
     '-ac 1',                      // モノラル

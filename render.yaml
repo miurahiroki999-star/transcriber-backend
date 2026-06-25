@@ -9,7 +9,7 @@ services:
     name: audio-transcriber-backend
     env: node
     # ffmpegをインストールしてからnpm installを実行
-    buildCommand: apt-get install -y ffmpeg && npm install
+    buildCommand: npm install
     startCommand: node server.js
     envVars:
       - key: OPENAI_API_KEY
