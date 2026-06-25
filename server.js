@@ -326,10 +326,28 @@ app.post('/api/generate-srt', upload.single('audioFile'), async (req, res) => {
   const captionMode = ['context', 'short', 'seminar'].includes(req.body.captionMode)
     ? req.body.captionMode
     : 'context';
+  const fixedDisplaySec = parseFloat(req.body.fixedDisplaySec) || 2.0;
+
+  // ── 字幕終了タイミング関連（新規） ──────────────────────────────────
+  const captionEndMode = ['speech_exact', 'min_duration', 'fixed'].includes(req.body.captionEndMode)
+    ? req.body.captionEndMode
+    : 'speech_exact';
+  const endPaddingSec = parseFloat(req.body.endPaddingSec) || 0.1;
 
   const maxCaptionChars = charsPerLine * maxLines;
 
-  const captionSettings = { chunkMinutes, charsPerLine, maxLines, minDuration, maxDuration, captionMode, maxCaptionChars };
+  const captionSettings = {
+    chunkMinutes,
+    charsPerLine,
+    maxLines,
+    minDuration,
+    maxDuration,
+    captionMode,
+    maxCaptionChars,
+    captionEndMode,  // speech_exact / min_duration / fixed
+    endPaddingSec,   // 終了余白（秒）
+    fixedDisplaySec, // fixedモード用固定表示秒数
+  };
 
   console.log(`=== SRT生成開始 ===`);
   console.log(`設定: ${JSON.stringify(captionSettings)}`);
@@ -518,7 +536,7 @@ app.post('/api/generate-srt', upload.single('audioFile'), async (req, res) => {
   const completedChunks = chunkResults.filter(c => c.status === 'completed').length;
 
   console.log(`=== SRT生成完了 ===`);
-  console.log(`字幕数: ${captions.length}, タイミング源: ${timingSource}`);
+  console.log(`字幕数: ${captions.length}, タイミング源: ${timingSource}, 終了モード: ${captionEndMode}`);
 
   return res.json({
     success: true,
@@ -531,6 +549,7 @@ app.post('/api/generate-srt', upload.single('audioFile'), async (req, res) => {
     captionSettings,
     chunks: chunkResults,
     timingSource,
+    captionEndMode,
     ...(timingSource === 'segment'
       ? { warning: 'word timestamps が取得できなかったため、segments と文字数比でSRTを生成しました。タイミングは目安を含みます。' }
       : {}),
@@ -547,18 +566,17 @@ app.post('/api/generate-srt', upload.single('audioFile'), async (req, res) => {
 //   3. 各文の開始・終了はword timestampsから引く
 //   4. 1文が収まるなら1字幕に。長い場合のみ読点→意味単位で分割
 //   5. 文字数で切る場合も助詞先頭・末尾NG語を徹底チェックして回避
+//   6. captionEndMode に応じて終了時刻の決定ロジックを切り替える
 // ============================================================
 function buildCaptionsFromWords(words, settings) {
-  const { charsPerLine, maxLines, minDuration, maxDuration, captionMode } = settings;
+  const { charsPerLine, maxLines, minDuration, maxDuration, captionMode,
+          captionEndMode, endPaddingSec, fixedDisplaySec } = settings;
   const maxCaptionChars = charsPerLine * maxLines;
 
   // ── STEP1: 全wordを連結して文字列＋時刻マップを作る ──────────────────
-  // word.word は先頭にスペースが入る場合があるので除去してそのまま連結
-  // 日本語の word timestamps は文字単位に近いため、そのまま連結でOK
   const fullText = words.map(w => w.word).join('');
 
   // 各文字位置がどのwordに対応するかのマップを作る
-  // charToWordIndex[i] = そのword配列のindex
   const charToWordIndex = [];
   let pos = 0;
   for (let wi = 0; wi < words.length; wi++) {
@@ -570,8 +588,6 @@ function buildCaptionsFromWords(words, settings) {
   }
 
   // ── STEP2: 句点・疑問符・感嘆符で「文」に分割する ──────────────────
-  // 句読点の直後を区切りとして「文」リストを作る
-  // 各文は { text, startCharIdx, endCharIdx } を持つ
   const sentenceBreakChars = new Set(['。', '！', '？', '!', '?']);
   const sentences = []; // { text, startCharIdx, endCharIdx }
 
@@ -594,51 +610,96 @@ function buildCaptionsFromWords(words, settings) {
     }
   }
 
-  // 文が0件の場合（句点が一切ない場合）は全体を1文として扱う
+  // 文が0件の場合は全体を1文として扱う
   if (sentences.length === 0) {
     sentences.push({ text: fullText.trim(), startCharIdx: 0, endCharIdx: fullText.length - 1 });
   }
 
   // ── STEP3: 各文の開始・終了秒をword timestampsから取得する ──────────────────
   const sentencesWithTime = sentences.map(sent => {
-    // startCharIdx が fullText の範囲外になる場合の安全処理
     const safeStart = Math.min(sent.startCharIdx, charToWordIndex.length - 1);
-    const safeEnd = Math.min(sent.endCharIdx, charToWordIndex.length - 1);
+    const safeEnd   = Math.min(sent.endCharIdx,   charToWordIndex.length - 1);
     const startWordIdx = charToWordIndex[safeStart] !== undefined ? charToWordIndex[safeStart] : 0;
-    const endWordIdx = charToWordIndex[safeEnd] !== undefined ? charToWordIndex[safeEnd] : words.length - 1;
+    const endWordIdx   = charToWordIndex[safeEnd]   !== undefined ? charToWordIndex[safeEnd]   : words.length - 1;
     return {
       text: sent.text,
       start: words[startWordIdx].start,
       end: words[endWordIdx].end,
+      startWordIdx,
+      endWordIdx,
     };
   });
 
   // ── STEP4: 各文を字幕に変換する ──────────────────
-  // 1文が maxCaptionChars 以下 → 1字幕
-  // 1文が長い → 読点 → 意味単位 → 文字数 の順で分割
-  const rawCaptions = []; // { text, start, end }
+  // 各字幕に startWordIdx / endWordIdx を引き継ぐ
+  const rawCaptions = []; // { text, start, end, startWordIdx, endWordIdx, isWordIndexFallback }
 
   for (const sent of sentencesWithTime) {
-    const subCaptions = splitSentenceIntoCaptions(sent.text, sent.start, sent.end, settings);
+    const subCaptions = splitSentenceIntoCaptions(
+      sent.text, sent.start, sent.end,
+      sent.startWordIdx, sent.endWordIdx,
+      words, charToWordIndex, fullText,
+      settings
+    );
     for (const sc of subCaptions) {
       rawCaptions.push(sc);
     }
   }
 
-  // ── STEP5: 時間の最短・最長を適用し、重なり補正する ──────────────────
-  const captions = rawCaptions.map(cap => {
-    let { start, end, text } = cap;
-    if (end - start < minDuration) {
-      end = start + minDuration;
-    }
-    if (end - start > maxDuration) {
-      end = start + maxDuration;
-    }
+  // ── STEP5: captionEndMode に応じて終了時刻を決定し、整形する ──────────────────
+  const captions = rawCaptions.map((cap, idx) => {
+    let { start, end, text, endWordIdx, isWordIndexFallback } = cap;
     const formattedText = formatCaptionText(text.trim(), charsPerLine, maxLines);
+
+    // 次の字幕の開始時刻（重なり防止用）
+    const nextStart = (idx < rawCaptions.length - 1) ? rawCaptions[idx + 1].start : Infinity;
+
+    if (captionEndMode === 'speech_exact') {
+      // ── speech_exact: 最後のword.end + endPaddingSec で終わらせる ──
+      let speechEnd;
+      if (endWordIdx !== undefined && endWordIdx >= 0 && endWordIdx < words.length) {
+        // word index が有効：実際の発話終わりを使う
+        speechEnd = words[endWordIdx].end + endPaddingSec;
+      } else {
+        // fallback: 文字数比で推定したendを使う（コード上のフォールバック）
+        // fallback: word indexへ戻せなかったため文字数比推定値を使用
+        speechEnd = end + endPaddingSec;
+      }
+      // 次の字幕に重ならないようにキャップ
+      end = Math.min(speechEnd, nextStart - 0.01);
+      // endがstartより前になるケースの安全処理
+      if (end <= start) {
+        end = Math.min(start + 0.1, nextStart - 0.01);
+      }
+
+    } else if (captionEndMode === 'min_duration') {
+      // ── min_duration: 現在に近い方式。短すぎる字幕は伸ばす ──
+      if (end - start < minDuration) {
+        end = start + minDuration;
+      }
+      if (end - start > maxDuration) {
+        end = start + maxDuration;
+      }
+      // 次の字幕に重ならないようにキャップ
+      end = Math.min(end, nextStart - 0.01);
+      if (end <= start) {
+        end = start + 0.1;
+      }
+
+    } else if (captionEndMode === 'fixed') {
+      // ── fixed: 開始から固定秒数だけ表示 ──
+      end = start + fixedDisplaySec;
+      // 次の字幕に重ならないようにキャップ
+      end = Math.min(end, nextStart - 0.01);
+      if (end <= start) {
+        end = start + 0.1;
+      }
+    }
+
     return { start, end, text: formattedText };
   });
 
-  // 重複補正
+  // 重複補正（念のため）
   for (let i = 1; i < captions.length; i++) {
     if (captions[i - 1].end > captions[i].start) {
       captions[i - 1].end = captions[i].start - 0.01;
@@ -654,26 +715,23 @@ function buildCaptionsFromWords(words, settings) {
 // ============================================================
 // 1つの「文」を、設定に従って1つ以上の字幕テキストに分割する
 // 優先順位：句点→読点→意味切れ目→文字数（助詞先頭NG/末尾NG語チェック付き）
-// start/end の時間は文全体を文字数比で比例配分する
+// word index を引き継いで、各字幕の endWordIdx を設定する
 // ============================================================
-function splitSentenceIntoCaptions(text, start, end, settings) {
-  const { charsPerLine, maxLines, captionMode } = settings;
+function splitSentenceIntoCaptions(text, start, end, startWordIdx, endWordIdx, words, charToWordIndex, fullTextAll, settings) {
+  const { charsPerLine, maxLines } = settings;
   const maxCaptionChars = charsPerLine * maxLines;
-  const totalDuration = end - start;
 
   // 文が収まるなら1字幕のまま返す
   if (text.length <= maxCaptionChars) {
-    return [{ text, start, end }];
+    return [{ text, start, end, startWordIdx, endWordIdx, isWordIndexFallback: false }];
   }
 
-  // 読点で分割を試みる
-  const commaBreakChars = ['、', '，', ','];
-
   // 読点での自然な分割を試みる
+  const commaBreakChars = ['、', '，', ','];
   const parts = splitAtNaturalBreaks(text, maxCaptionChars, commaBreakChars);
 
-  // 得たパーツに時刻を割り当てて返す
-  return assignTimesToParts(parts, text, start, end);
+  // 得たパーツに時刻を割り当て、word index も割り当てる
+  return assignTimesToPartsWithWordIndex(parts, text, start, end, startWordIdx, endWordIdx, words, charToWordIndex, fullTextAll);
 }
 
 // ============================================================
@@ -689,10 +747,7 @@ function splitAtNaturalBreaks(text, maxChars, breakChars) {
     // maxChars の範囲内で末尾から読点を探す
     for (let pos = maxChars - 1; pos >= Math.floor(maxChars * 0.4); pos--) {
       if (breakChars.includes(remaining[pos])) {
-        // 読点の直後で切る（読点は前のパートに含める）
-        const candidate = remaining.slice(0, pos + 1);
         const next = remaining.slice(pos + 1);
-        // 次のパートの先頭がNGにならないかチェック
         if (next.length > 0 && !isNgHeadChar(next[0])) {
           breakPos = pos + 1;
           break;
@@ -731,7 +786,6 @@ function splitByCharsNatural(text, maxChars) {
       break;
     }
 
-    // maxChars の位置から前後を探して最適な切り位置を見つける
     let breakPos = findNaturalBreakPos(remaining, maxChars);
     parts.push(remaining.slice(0, breakPos));
     remaining = remaining.slice(breakPos);
@@ -744,17 +798,14 @@ function splitByCharsNatural(text, maxChars) {
 // 文字列の自然な切り位置を見つける（助詞先頭・末尾NG語を回避）
 // ============================================================
 function findNaturalBreakPos(text, maxChars) {
-  // maxCharsを上限として、前後を探す
-  const searchForward = Math.min(text.length, Math.floor(maxChars * 1.3)); // 最大30%まで伸ばせる
-  const searchBack = Math.floor(maxChars * 0.5); // 最大50%まで戻れる
+  const searchForward = Math.min(text.length, Math.floor(maxChars * 1.3));
+  const searchBack = Math.floor(maxChars * 0.5);
 
-  // 理想の切り位置（maxChars）から前方向に探す
   for (let pos = maxChars; pos >= searchBack; pos--) {
     if (pos <= 0) break;
     const nextChar = text[pos] || '';
     const prevChar = text[pos - 1] || '';
 
-    // 句点・読点の直後は良い切り位置
     if ('。！？、，!?,'.includes(prevChar)) {
       if (!isNgHeadChar(nextChar)) {
         return pos;
@@ -762,11 +813,8 @@ function findNaturalBreakPos(text, maxChars) {
     }
   }
 
-  // 前方向で見つからなかった場合：maxCharsを基準に助詞先頭を回避
-  // maxChars位置の直後がNG先頭文字の場合、前後に逃げる
   let pos = maxChars;
 
-  // posを後ろにずらしてNG先頭を回避
   while (pos < searchForward && pos < text.length) {
     const nextChar = text[pos] || '';
     if (!isNgHeadChar(nextChar)) {
@@ -775,7 +823,6 @@ function findNaturalBreakPos(text, maxChars) {
     pos++;
   }
 
-  // それでもNG先頭になる場合は前方向へ
   if (pos >= searchForward || isNgHeadChar(text[pos] || '')) {
     pos = maxChars;
     while (pos > searchBack) {
@@ -787,7 +834,6 @@ function findNaturalBreakPos(text, maxChars) {
     }
   }
 
-  // 末尾がNG語になっていないかチェック（なる場合は+1）
   const slice = text.slice(0, pos);
   if (isNgTailWord(slice)) {
     pos = Math.min(pos + 1, text.length);
@@ -798,18 +844,15 @@ function findNaturalBreakPos(text, maxChars) {
 
 // ============================================================
 // 字幕先頭になってはいけない文字かどうかを判定する
-// NG：助詞、「ま」「です」など
 // ============================================================
 function isNgHeadChar(ch) {
   if (!ch) return false;
-  // 1文字の助詞・接続助詞・接尾語
   const ngChars = new Set(['の', 'に', 'を', 'が', 'は', 'も', 'と', 'で', 'へ', 'や', 'な', 'ね', 'よ', 'か', 'わ', 'ぞ', 'ぜ', 'さ', 'し']);
   return ngChars.has(ch);
 }
 
 // ============================================================
 // 字幕末尾がNG語になっていないか確認する
-// NG：「次」「い」「また」「この」「その」「あの」「どの」など
 // ============================================================
 function isNgTailWord(text) {
   if (!text) return false;
@@ -822,13 +865,39 @@ function isNgTailWord(text) {
 }
 
 // ============================================================
-// 分割したパーツに開始・終了時刻を文字数比で割り当てる
+// 分割したパーツに開始・終了時刻とword indexを割り当てる
+//
+// 文字位置 → charToWordIndex → words[idx].end を使って
+// 各パーツの endWordIdx を決定する。
+// charToWordIndex が fullText 全体のマップのため、
+// 分割されたパーツのテキストを fullTextAll から探して位置を特定する。
 // ============================================================
-function assignTimesToParts(parts, originalText, start, end) {
+function assignTimesToPartsWithWordIndex(parts, originalText, start, end, startWordIdx, endWordIdx, words, charToWordIndex, fullTextAll) {
   const totalDuration = end - start;
   const totalChars = originalText.length;
   const result = [];
   let currentTime = start;
+
+  // originalText が fullTextAll のどこにあるかを特定する
+  // （sentenceWithTime の startCharIdx に相当する全体オフセット）
+  // words から start 時刻で逆引きしてオフセットを求める
+  let globalOffset = -1;
+  for (let wi = 0; wi < words.length; wi++) {
+    if (words[wi] && Math.abs(words[wi].start - words[startWordIdx].start) < 0.001) {
+      // startWordIdx の word が fullTextAll 上で占める位置を計算
+      let charPos = 0;
+      for (let i = 0; i < startWordIdx; i++) {
+        charPos += words[i].word.length;
+      }
+      globalOffset = charPos;
+      break;
+    }
+  }
+
+  // globalOffset が -1 の場合は fallback（文字数比のみ）
+  const canUseWordIndex = (globalOffset >= 0 && charToWordIndex && charToWordIndex.length > 0);
+
+  let partCharOffset = 0; // originalText 内での文字位置
 
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
@@ -836,7 +905,38 @@ function assignTimesToParts(parts, originalText, start, end) {
     const duration = totalDuration * ratio;
     const partStart = currentTime;
     const partEnd = i === parts.length - 1 ? end : currentTime + duration;
-    result.push({ text: part, start: partStart, end: partEnd });
+
+    // このパーツの最後の文字が fullTextAll 上でどの word に対応するか
+    let partEndWordIdx = endWordIdx;        // デフォルトは親文の endWordIdx
+    let isWordIndexFallback = false;
+
+    if (canUseWordIndex) {
+      // partCharOffset + part.length - 1 = このパーツの最後の文字の originalText 内での位置
+      const lastCharInOriginal = partCharOffset + part.length - 1;
+      const globalCharIdx = globalOffset + lastCharInOriginal;
+
+      if (globalCharIdx >= 0 && globalCharIdx < charToWordIndex.length && charToWordIndex[globalCharIdx] !== undefined) {
+        partEndWordIdx = charToWordIndex[globalCharIdx];
+      } else {
+        // fallback: charToWordIndex の範囲外
+        // fallback: globalCharIdx が charToWordIndex の範囲外のため文字数比推定値を使用
+        isWordIndexFallback = true;
+      }
+    } else {
+      // fallback: globalOffset が取得できなかったため文字数比推定値を使用
+      isWordIndexFallback = true;
+    }
+
+    result.push({
+      text: part,
+      start: partStart,
+      end: partEnd,
+      startWordIdx: i === 0 ? startWordIdx : undefined,
+      endWordIdx: partEndWordIdx,
+      isWordIndexFallback,
+    });
+
+    partCharOffset += part.length;
     currentTime = partEnd;
   }
 
@@ -847,7 +947,7 @@ function assignTimesToParts(parts, originalText, start, end) {
 // SRT生成ロジック：segments fallback
 // ============================================================
 function buildCaptionsFromSegments(segments, settings) {
-  const { charsPerLine, maxLines, minDuration, maxDuration } = settings;
+  const { charsPerLine, maxLines, minDuration, maxDuration, captionEndMode, endPaddingSec, fixedDisplaySec } = settings;
   const maxCaptionChars = charsPerLine * maxLines;
   const captions = [];
 
@@ -856,7 +956,6 @@ function buildCaptionsFromSegments(segments, settings) {
 
     if (!segText) continue;
 
-    // まず句点で文に分割してから字幕化する
     const sentenceBreakChars = new Set(['。', '！', '？', '!', '?']);
     const sentences = [];
     let sentStart = 0;
@@ -877,18 +976,24 @@ function buildCaptionsFromSegments(segments, settings) {
     const segDuration = seg.end - seg.start;
 
     for (const sentText of sentences) {
-      const ratio = sentText.length / segText.length;
-      const sentDuration = segDuration * ratio;
-
       const subParts = sentText.length <= maxCaptionChars
         ? [sentText]
         : splitByCharsNatural(sentText, maxCaptionChars);
 
       for (const part of subParts) {
         let start = seg.start;
+        // segments fallback では word.end が取れないため、
+        // captionEndMode に関わらず現行ロジックに近い処理を使う
         let end = seg.end;
-        if (end - start < minDuration) end = start + minDuration;
-        if (end - start > maxDuration) end = start + maxDuration;
+        if (captionEndMode === 'fixed') {
+          end = start + fixedDisplaySec;
+        } else if (captionEndMode === 'min_duration') {
+          if (end - start < minDuration) end = start + minDuration;
+          if (end - start > maxDuration) end = start + maxDuration;
+        } else {
+          // speech_exact でも segments の場合は seg.end + endPaddingSec を使う（word がないため）
+          end = seg.end + endPaddingSec;
+        }
         const text = formatCaptionText(part.trim(), charsPerLine, maxLines);
         captions.push({ start, end, text });
       }
@@ -917,24 +1022,18 @@ function formatCaptionText(text, charsPerLine, maxLines) {
     return text;
   }
 
-  // 2行表示の場合：自然な位置で改行
-  // 優先：句点・読点の直後
-  // 次点：ほぼ中央付近
   const targetBreak = Math.ceil(text.length / 2);
   const naturalBreakAfter = ['。', '！', '？', '、', '，', '!', '?', ','];
 
   let breakPos = targetBreak;
   const searchRange = Math.floor(charsPerLine / 2);
 
-  // targetBreak周辺で自然な区切りを探す
   for (let d = 0; d <= searchRange; d++) {
-    // 後ろ方向優先で探す（前半を短くしない）
     for (const delta of [d, -d]) {
       const pos = targetBreak + delta;
       if (pos > 0 && pos < text.length) {
         const prevChar = text[pos - 1];
         const nextChar = text[pos] || '';
-        // 句点・読点の直後かつ次の文字がNG先頭でない場所
         if (naturalBreakAfter.includes(prevChar) && !isNgHeadChar(nextChar)) {
           breakPos = pos;
           break;
@@ -944,14 +1043,11 @@ function formatCaptionText(text, charsPerLine, maxLines) {
     if (breakPos !== targetBreak) break;
   }
 
-  // 見つからなかった場合：NG先頭にならない位置を探す
   if (breakPos === targetBreak) {
     let pos = targetBreak;
-    // 前方向に助詞先頭を回避
     while (pos > 1 && isNgHeadChar(text[pos] || '')) {
       pos--;
     }
-    // 後方向でも試す
     if (isNgHeadChar(text[pos] || '')) {
       pos = targetBreak;
       while (pos < text.length - 1 && isNgHeadChar(text[pos] || '')) {
@@ -964,9 +1060,6 @@ function formatCaptionText(text, charsPerLine, maxLines) {
   const line1 = text.slice(0, breakPos);
   const line2 = text.slice(breakPos);
 
-  // 各行がcharsPerLineを超える場合の安全処理
-  // 以前の実装では text.slice(charsPerLine, charsPerLine * 2) により、
-  // まれに字幕本文の後半が欠落する可能性があったため、絶対に文字を捨てない。
   if (line1.length > charsPerLine) {
     const saferBreak = findNaturalBreakPos(text, charsPerLine);
     return text.slice(0, saferBreak) + '\n' + text.slice(saferBreak);
@@ -991,7 +1084,6 @@ function buildSrtString(captions) {
 // 秒数 → SRT時間形式（HH:MM:SS,mmm）
 // ============================================================
 function secondsToSrtTime(totalSeconds) {
-  // SRT形式は HH:MM:SS,mmm。mmm が 1000 になるとPremiereで読み込み不具合の原因になるため、ミリ秒総数から安全に計算する。
   const totalMs = Math.max(0, Math.round(totalSeconds * 1000));
   const hh = String(Math.floor(totalMs / 3600000)).padStart(2, '0');
   const mm = String(Math.floor((totalMs % 3600000) / 60000)).padStart(2, '0');
