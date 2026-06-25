@@ -46,13 +46,6 @@ const upload = multer({
     fileSize: 500 * 1024 * 1024, // 500MB上限（長尺音声対応）
   },
   fileFilter: (req, file, cb) => {
-    const allowed = [
-      'audio/mp4', 'audio/m4a', 'audio/x-m4a',
-      'audio/mpeg', 'audio/mp3',
-      'audio/wav', 'audio/wave', 'audio/x-wav',
-      'audio/ogg', 'audio/webm',
-      'video/mp4',
-    ];
     // mimetypeが不明でもとりあえず受け付ける（拡張子で判断するため）
     cb(null, true);
   },
@@ -112,48 +105,53 @@ app.post('/api/transcribe', upload.single('audioFile'), async (req, res) => {
 
   // ── (3) パラメータ取得 ──────────────────────────────────
   const allowedModels = ['gpt-4o-mini-transcribe', 'gpt-4o-transcribe', 'whisper-1'];
-  const model = allowedModels.includes(req.body.model) ? req.body.model : 'gpt-4o-mini-transcribe';
+  const model = allowedModels.includes(req.body.model) ? req.body.model : 'whisper-1';
 
   const chunkMinutesRaw = parseInt(req.body.chunkMinutes, 10);
   const chunkMinutes = [5, 10, 15].includes(chunkMinutesRaw) ? chunkMinutesRaw : 10;
   const chunkSeconds = chunkMinutes * 60;
 
+  // タイムコードモード：segment（発話セグメント単位） or chunk（チャンク単位のみ）
+  const timecodeMode = req.body.timecodeMode === 'chunk' ? 'chunk' : 'segment';
+
+  const isGpt4oModel = model === 'gpt-4o-mini-transcribe' || model === 'gpt-4o-transcribe';
+  const useSegment = model === 'whisper-1' && timecodeMode === 'segment';
+
   console.log(`=== 文字起こし開始 ===`);
   console.log(`モデル: ${model}`);
+  console.log(`タイムコードモード: ${timecodeMode}`);
   console.log(`分割単位: ${chunkMinutes}分（${chunkSeconds}秒）`);
   console.log(`ファイルサイズ: ${(req.file.size / 1024 / 1024).toFixed(1)}MB`);
 
   // ── (4) ffmpegで音声を分割 ──────────────────────────────────
-  // 分割後ファイルのプレフィックス（/tmp/chunk_TIMESTAMP_）
   const timestamp = Date.now();
   const chunkPrefix = `/tmp/chunk_${timestamp}_`;
   const chunkPattern = `${chunkPrefix}%03d.mp3`;
 
   const ffmpegCmd = [
     `"${ffmpegPath}"`,
-    '-y',                         // 上書き確認なし
-    `-i "${uploadedPath}"`,       // 入力ファイル
-    '-ac 1',                      // モノラル
-    '-ar 16000',                  // 16kHz
-    '-b:a 32k',                   // 32kbps（文字起こし用に軽量化）
-    `-f segment`,                 // セグメント分割モード
-    `-segment_time ${chunkSeconds}`, // 分割秒数
-    `-reset_timestamps 1`,        // チャンクの時間を0リセット
-    `"${chunkPattern}"`,          // 出力パターン
+    '-y',
+    `-i "${uploadedPath}"`,
+    '-ac 1',
+    '-ar 16000',
+    '-b:a 32k',
+    `-f segment`,
+    `-segment_time ${chunkSeconds}`,
+    `-reset_timestamps 1`,
+    `"${chunkPattern}"`,
   ].join(' ');
 
   console.log('ffmpegコマンド実行中...');
 
   try {
-    await execAsync(ffmpegCmd, { timeout: 600000 }); // 最大10分
+    await execAsync(ffmpegCmd, { timeout: 600000 });
   } catch (err) {
     console.error('ffmpegエラー:', err.message);
     return sendError(500, 'ffmpegで音声の分割に失敗しました。音声ファイルの形式を確認してください。', err.message);
   }
 
-  // 生成されたチャンクファイルを収集
   const tmpFiles = fs.readdirSync('/tmp').filter(f => f.startsWith(`chunk_${timestamp}_`) && f.endsWith('.mp3'));
-  tmpFiles.sort(); // 000, 001, 002... の順にソート
+  tmpFiles.sort();
   tmpFiles.forEach(f => chunkPaths.push(path.join('/tmp', f)));
 
   if (chunkPaths.length === 0) {
@@ -165,6 +163,11 @@ app.post('/api/transcribe', upload.single('audioFile'), async (req, res) => {
   // ── (5) 各チャンクをOpenAI APIで文字起こし ──────────────────────────────────
   const chunkResults = [];
   let fullText = '';
+
+  // gpt-4o系の場合、冒頭に注意文を一度だけ追加
+  if (isGpt4oModel) {
+    fullText += `この結果は ${model} で文字起こししたため、発話セグメント単位のタイムコードではありません。正確な位置確認には whisper-1 を使用してください。\n\n`;
+  }
 
   for (let i = 0; i < chunkPaths.length; i++) {
     const chunkPath = chunkPaths[i];
@@ -182,9 +185,10 @@ app.post('/api/transcribe', upload.single('audioFile'), async (req, res) => {
       formData.append('model', model);
       formData.append('language', 'ja');
 
-      // whisper-1 は verbose_json でセグメントタイムスタンプを取得
-      if (model === 'whisper-1') {
+      if (useSegment) {
+        // whisper-1 + segmentモード：セグメントタイムスタンプを取得
         formData.append('response_format', 'verbose_json');
+        formData.append('timestamp_granularities[]', 'segment');
       } else {
         formData.append('response_format', 'json');
       }
@@ -211,20 +215,35 @@ app.post('/api/transcribe', upload.single('audioFile'), async (req, res) => {
 
       const result = await response.json();
 
-      // タイムコード付きテキストを構築
       let chunkText = '';
+      let segmentCount = 0;
 
-      if (model === 'whisper-1' && result.segments && result.segments.length > 0) {
-        // whisper-1: セグメントごとの正確なタイムスタンプを使用
-        for (const seg of result.segments) {
-          const absStart = startSec + seg.start;
-          const tc = secondsToTimecode(absStart);
-          chunkText += `${tc}\n${seg.text.trim()}\n\n`;
+      if (useSegment) {
+        // whisper-1 + segmentモード
+        if (result.segments && result.segments.length > 0) {
+          // セグメントタイムスタンプで正確に付与
+          for (const seg of result.segments) {
+            const absStart = startSec + seg.start;
+            const tc = secondsToTimecode(absStart);
+            chunkText += `${tc}\n${seg.text.trim()}\n\n`;
+          }
+          segmentCount = result.segments.length;
+        } else {
+          // segments が返らなかった場合：チャンク単位で出力＋注意文
+          const tc = secondsToTimecode(startSec);
+          chunkText = `${tc}\nwhisper-1 のセグメントタイムスタンプが取得できなかったため、この結果はチャンク単位のタイムコードです。\n${(result.text || '').trim()}\n\n`;
+          segmentCount = 0;
         }
-      } else {
-        // gpt-4o系: チャンク開始時刻のみ付与（推定）
+      } else if (model === 'whisper-1' && timecodeMode === 'chunk') {
+        // whisper-1 + chunkモード（ユーザーが明示的にチャンク単位を選択）
         const tc = secondsToTimecode(startSec);
         chunkText = `${tc}\n${(result.text || '').trim()}\n\n`;
+        segmentCount = 0;
+      } else {
+        // gpt-4o系：チャンク開始時刻のみ
+        const tc = secondsToTimecode(startSec);
+        chunkText = `${tc}\n${(result.text || '').trim()}\n\n`;
+        segmentCount = 0;
       }
 
       fullText += chunkText;
@@ -233,10 +252,11 @@ app.post('/api/transcribe', upload.single('audioFile'), async (req, res) => {
         index: chunkIndex,
         startSec,
         status: 'completed',
-        text: (result.text || '').substring(0, 100) + '...', // ログ用に先頭100文字
+        segmentCount,
+        timecodeMode: useSegment ? 'segment' : 'chunk',
       });
 
-      console.log(`チャンク ${chunkIndex} 完了`);
+      console.log(`チャンク ${chunkIndex} 完了（segments: ${segmentCount}）`);
 
     } catch (err) {
       console.error(`チャンク ${chunkIndex} 失敗:`, err.message);
@@ -244,9 +264,10 @@ app.post('/api/transcribe', upload.single('audioFile'), async (req, res) => {
         index: chunkIndex,
         startSec,
         status: 'failed',
+        segmentCount: 0,
+        timecodeMode: useSegment ? 'segment' : 'chunk',
         error: err.message,
       });
-      // 失敗したチャンクはスキップして継続
       const tc = secondsToTimecode(startSec);
       fullText += `${tc}\n[チャンク${chunkIndex}の文字起こしに失敗しました: ${err.message}]\n\n`;
     }
@@ -264,6 +285,7 @@ app.post('/api/transcribe', upload.single('audioFile'), async (req, res) => {
     success: true,
     text: fullText.trim(),
     model,
+    timecodeMode: useSegment ? 'segment' : 'chunk',
     totalChunks: chunkPaths.length,
     completedChunks: chunkResults.length - failedCount,
     failedChunks: failedCount,
